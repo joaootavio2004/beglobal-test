@@ -1,26 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Compute an Attractiveness Index for a single country CSV from Be Global
-and suggest a Marketing Local target based on per-capita heuristics.
-
+Compute a simple Attractiveness Index for a single country CSV from Be Global.
 Usage:
-  python be_global_index.py --csv dados.csv [--bench be_global_benchmarks.json] [--weights be_global_weights.json] [--competitors N]
+  python be_global_index.py --csv "Be Global - Grupo 4(Market Analyzes).csv" [--bench be_global_benchmarks.json] [--weights be_global_weights.json]
 
 Notes:
-- Index uses the categories that dominated calibration on R1:
-  ECONÔMICO (PIB, PIB per capita, Cresc. PIB) and INFRA/REG (Ease, Estradas, Regulação).
+- This "simple" scorer uses only the categories that dominated calibration on R1:
+  ECONÔMICO (PIB, PIB per capita, Crescimento do PIB) and INFRA/REG (Ease, Estradas, Regulação).
 - Each feature is normalized with MIN-MAX using the provided benchmarks file.
 - Final score = 100 × ( w_econ*econ_index + w_infra*infra_index ), where the two
   sub-indices are the average of their normalized features.
-- The "Local MKT suggestion" uses the observed efficient per-capita band from R1:
-  ~US$ 0.015–0.020 per inhabitant.
-  We map the target per-capita to the attractiveness bucket:
-     score ≥ 60  →  pc_target = 0.015
-     30 ≤ score < 60 → pc_target = 0.018
-     score < 30 → pc_target = 0.020  (avoid exceeding this; consider saving cash)
-- Competitors (optional): if competitors ≥ 2, we recommend shifting part of the budget to GLOBAL
-  instead of overshooting LOCAL. We propose a split of 70% LOCAL / 30% GLOBAL; otherwise 85%/15%.
+- Benchmarks/weights can be recalibrated later with more countries.
 """
 import argparse, json, re
 import pandas as pd
@@ -62,29 +53,15 @@ def to_number(x):
         return np.nan
 
 def minmax_norm(val, vmin, vmax):
-    if val is None or (isinstance(val,float) and np.isnan(val)) or vmin==vmax:
+    if np.isnan(val) or vmin==vmax:
         return 0.0
-    x = float(val)
-    z = (x - vmin)/(vmax - vmin)
-    if z < 0: z = 0.0
-    if z > 1: z = 1.0
-    return z
-
-def suggest_pc(score100: float) -> float:
-    """Per-capita local marketing target (US$/hab) based on attractiveness score."""
-    if score100 >= 60.0:
-        return 0.015
-    elif score100 >= 30.0:
-        return 0.018
-    else:
-        return 0.020
+    return max(0.0, min(1.0, (val - vmin)/(vmax - vmin)))
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True, help="Caminho do CSV do país (formato Be Global)")
     ap.add_argument("--bench", default="be_global_benchmarks.json", help="JSON com min/max por feature")
     ap.add_argument("--weights", default="be_global_weights.json", help="JSON com pesos por categoria")
-    ap.add_argument("--competitors", type=int, default=1, help="Nº de concorrentes na região (opcional, afeta split Local/Global)")
     args = ap.parse_args()
 
     df = read_csv_safely(args.csv)
@@ -112,12 +89,18 @@ def main():
     for k,v in econ_feats.items():
         x = to_number(v)
         b = bench.get(k, None)
-        econ_norm.append( minmax_norm(x, b["min"], b["max"]) if b else 0.0 )
+        if b is None:
+            econ_norm.append(0.0)
+        else:
+            econ_norm.append( minmax_norm(x, b["min"], b["max"]) )
     infra_norm = []
     for k,v in infra_feats.items():
         x = to_number(v)
         b = bench.get(k, None)
-        infra_norm.append( minmax_norm(x, b["min"], b["max"]) if b else 0.0 )
+        if b is None:
+            infra_norm.append(0.0)
+        else:
+            infra_norm.append( minmax_norm(x, b["min"], b["max"]) )
 
     econ_idx = float(np.mean(econ_norm)) if econ_norm else 0.0
     infra_idx = float(np.mean(infra_norm)) if infra_norm else 0.0
@@ -128,43 +111,11 @@ def main():
     score01 = w_econ*econ_idx + w_infra*infra_idx
     score100 = 100.0*score01
 
-    # Population for per-capita suggestion
-    pop_val = get_val(block, "Tamanho da população")
-    pop = to_number(pop_val)
-
-    # Suggestion
-    pc_target = suggest_pc(score100)  # US$ per capita LOCAL
-    local_target_usd = pop * pc_target if (pop is not None and not np.isnan(pop)) else np.nan
-
-    # Split Local vs Global based on competitors (heuristic)
-    if args.competitors >= 2:
-        local_share, global_share = 0.70, 0.30
-        split_note = "Concorrência ≥ 2 → usar 70% LOCAL / 30% GLOBAL."
-    else:
-        local_share, global_share = 0.85, 0.15
-        split_note = "Concorrência ≤ 1 → usar 85% LOCAL / 15% GLOBAL."
-
-    # If competition high, don't exceed pc_target on LOCAL; push any excess to GLOBAL.
-    local_budget_usd = local_target_usd * local_share if not np.isnan(local_target_usd) else np.nan
-    global_budget_usd = local_target_usd * global_share if not np.isnan(local_target_usd) else np.nan
-
-    # Output
     print("País:", country)
     print("Índice Econômico (0–1):", round(econ_idx,4))
     print("Índice Infra/Reg (0–1):", round(infra_idx,4))
     print("Pesos → Econômico:", w_econ, "| Infra/Reg:", w_infra)
     print("ÍNDICE DE ATRATIVIDADE (0–100):", round(score100,2))
-    if not np.isnan(pop):
-        print("População:", int(pop))
-        print("Meta MKT LOCAL per capita (US$/hab):", pc_target)
-        print("Meta MKT LOCAL total (US$):", round(local_target_usd,2))
-        print("   → Em milhões (US$ mi):", round(local_target_usd/1e6,3))
-        print(split_note)
-        print("Alocação sugerida:")
-        print("   LOCAL  ≈", round(local_budget_usd/1e6,3), "US$ mi")
-        print("   GLOBAL ≈", round(global_budget_usd/1e6,3), "US$ mi")
-    else:
-        print("Não foi possível ler a População; pulei a sugestão per-capita.")
 
 if __name__ == "__main__":
     main()
